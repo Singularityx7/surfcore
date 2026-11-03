@@ -77,7 +77,7 @@ test('conversation closure has a legal exit and stays distinct from diving', () 
 
 test('social autonomy and visual, forwarding, sticker and web capabilities remain described', () => {
   for (const text of [
-    '【群聊不是客服队列】', '【别当客服】', '【保持主体性】', '【学习群友策略】',
+    '【反 AI 味：拒绝有求必应】', '【保持主体性】', '【学习群友策略】',
     '【不要当群管家/主持人】', '普通对话默认 1 条，最多 2 条', '不要用空格断句',
     '不会自动发送到 QQ', 'qq_get_message_images', 'qq_get_forward_msg', 'nestedForwardIds',
     'qq_send_poke', 'qq_list_stickers', 'qq_get_sticker_image', 'qq_send_sticker',

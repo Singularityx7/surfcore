@@ -145,6 +145,11 @@ export function characterPaths(id) {
       pet: path.join(dir, 'persona.scenes', 'pet.md'),
     },
     memoryDir,
+    soulDir: path.join(dir, 'soul'),
+    soulState: path.join(dir, 'soul', 'state.json'),
+    soulNarrative: path.join(dir, 'soul', 'narrative.md'),
+    soulNarrativePrev: path.join(dir, 'soul', 'narrative.prev.md'),
+    soulChangelog: path.join(dir, 'soul', 'changelog.jsonl'),
     memoryJson: path.join(memoryDir, 'memory-card.json'),
     memoryMd: path.join(memoryDir, 'memory-card.md'),
     memoryPromptQq: path.join(memoryDir, 'memory-card-prompt-qq.md'),
@@ -406,6 +411,7 @@ export function createCharacter({ name, personaText, memoryCard, fullRecords, id
   const paths = characterPaths(id);
   ensureDir(paths.dir);
   ensureDir(paths.memoryDir);
+  ensureDir(paths.soulDir);
   ensureDir(paths.biliDir);
   ensureDir(paths.snapshotsDir);
   const persona = String(personaText ?? '').trim() || defaultPersona(cleanName);
@@ -540,6 +546,11 @@ export function snapshotCharacter(id, { slot, reason = 'manual', now = Date.now(
       copyFile(path.join(paths.biliDir, entry.name), path.join(tmp, 'bili', entry.name));
     }
   } catch {}
+  // 灵魂层：状态与最新/上一版叙事。changelog 是可追加的历史，不进快照。
+  ensureDir(path.join(tmp, 'soul'));
+  for (const file of ['state.json', 'narrative.md', 'narrative.prev.md']) {
+    copyFile(path.join(paths.soulDir, file), path.join(tmp, 'soul', file));
+  }
   const meta = readJson(path.join(tmp, 'snapshot.json'), {});
   atomicWriteJson(path.join(tmp, 'snapshot.json'), { ...meta, fullMemoryMode: fullMode });
   // Windows 不能 rename 覆盖非空目录：先把旧槽挪走再换入。
@@ -635,6 +646,9 @@ export function restoreSnapshot(id, slot, { now = Date.now() } = {}) {
       if (entry.isFile()) copyFile(path.join(source, 'bili', entry.name), path.join(paths.biliDir, entry.name));
     }
   } catch {}
+  for (const file of ['state.json', 'narrative.md', 'narrative.prev.md']) {
+    copyFile(path.join(source, 'soul', file), path.join(paths.soulDir, file));
+  }
   const manifest = readManifest(id);
   if (manifest) {
     const next = { ...manifest, updatedAt: new Date(now).toISOString() };

@@ -48,6 +48,7 @@ import * as characterStore from '../src/character-persona.js';
 import * as biliCard from '../src/bili-card.js';
 import * as historyCatchup from '../src/history-catchup.js';
 import * as purposeEngine from '../src/purpose-engine.js';
+import * as soul from '../src/soul.js';
 import * as conversationClosure from '../src/conversation-closure.js';
 import { fetchVideoInfo } from '../src/bili-api.js';
 import * as stateAcl from '../src/state-acl.mjs';
@@ -203,6 +204,8 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     buildWakePromptV2, buildWakeSnapshotV2, wakeFoldedNoticeV2, sendWakePromptV2, socialV2,
     currentRoleHint, currentRoleHintV2, adminPromptLine, ownerMessageTag,
     memoryCardPromptBlock, recordMemoryInboxEvent, recordSelfMemoryEvent,
+    soulWakeBlock, readSoulNarrative, soulReflectOnce: runSoulReflection,
+    getSoulState() { return soulState; },
     refreshMode, modeAllowed, trackTurnEvent, replayPendingWakeReasonsV2,
     // 人的黑名单（deny.users）：入站按发送者拦截，见 test-blacklist.mjs
     senderBlocked, handlePokeNotice,
@@ -272,6 +275,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     ...tokenBudget,
     ...adminIdentity, ...roleCard, ...personaLayers, ...wakePolicy, ...groupPolicy, ...actionPlanner, ...sessionMap, ...contextTelemetry, ...memoryCard, ...biliCard, ...characterStore, ...historyCatchup,
     ...questionAnswers, ...ownerAudit, ...turnGuard, ...gateEvents,
+    ...soul,
     ...purposeEngine,
     ...conversationClosure,
     // 角色系统在 fixture 里等价于「没有角色」：当前角色 null，记忆卡指向 temp/dsh/surfcore/memory。

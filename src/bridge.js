@@ -1967,8 +1967,9 @@ async function main() {
   // 存在 characters/<id>/soul/；没有角色系统时回退 state/soul/。
   const SOUL_PATHS = (() => {
     const cur = readCurrentCharacter();
-    const paths = cur?.id ? characterPaths(cur.id) : null;
-    const dir = paths ? (paths.soulDir || path.join(paths.dir, 'soul')) : path.join(STATE_DIR, 'soul');
+    const dir = cur?.id
+      ? (characterPaths(cur.id).soulDir || path.join(characterPaths(cur.id).dir, 'soul'))
+      : path.join(STATE_DIR, 'soul');
     return {
       dir,
       state: path.join(dir, 'state.json'),
