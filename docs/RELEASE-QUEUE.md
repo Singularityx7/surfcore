@@ -14,6 +14,55 @@
 
 ## 待发布
 
+### 批次 2026-10-30 · 灵魂层 P1 收口（专用反思预设 + 状态逻辑 + 按角色会话）
+<!-- release-batch: start=2026-10-30T00:00+08:00 end=2026-10-30T23:59+08:00 commits=2a5ab1f -->
+
+**覆盖提交**：`2a5ab1f`（cherry-pick 到 origin/main v0.8.8；已提交，待发布）
+**背景**：灵魂层首版已上线，但反思复用 `qq-chat-v2`、在意事每天被覆盖、换角色复用旧会话。
+**建议**：随 **0.8.9** 一起 patch（已合入 origin/main v0.8.8；等一次真实 03:40 反思）
+**状态**：已提交/待发布；合入 v0.8.8 后随下一版 0.8.9 发布。
+
+**问题**：
+1. 反思会话默认落到 `qq-chat-v2`（26KB QQ 工具协议 + 「AI 味」字样），内部叙事被污染；
+2. `applySoulReflection` 整体替换 `concerns`，14 天过期形同虚设；
+3. 反思提示词没有当前 valence/energy 锚点，模型可一天写成另一个人；
+4. `state/soul-session.json` 全局单文件，切换角色复用旧角色会话；
+5. 主人私聊不驱动灵魂状态，只有主动发言结算情绪；
+6. `test-qq-preset-contract` 在同步上游后失败（期望段落已改名）。
+
+**修法**：新增无工具 `soul-reflect` preset + `soul-reflect-guard`（执行期全拒）；`reflectPreset` 默认专用；
+`applySoulReflection` 合并 + `resolved` + 单日限幅；提示词加【你现在】；叙事脱敏/护栏；
+`lastSocialAt` 社交信号；`SOUL_PATHS.session` 按角色隔离并校验 `characterId`；补 `events.forget`；
+测试标记同步。
+
+**case**：[docs/cases/2026-10-30-soul-layer.md](cases/2026-10-30-soul-layer.md)
+
+**验证**：`test-soul` 13/13、`test-soul-wiring` OK、`test-agent-preset-patches`、`test-preset-local-tools` 8/8、
+`test-qq-preset-contract` 8/8、`test-character-store`；`npm run test:audit` **87/87**。
+
+**部署记录（2026-10-30 15:20，8.154.26.72）**：36 个文件已同步并校验（36/36）；
+`node --check` 与 preset patch 检查通过；`config.soul.reflectPreset="soul-reflect"`；
+`setup-dsh.mjs` 成功；DSH 重启后 `agentPresets/list` 含 `soul-reflect` 且 `broken` 为空，
+子行仅 `persona` + `soul-reflect-guard`；桥接重启为单实例；服务端 `test-soul` 13/13、
+`test-soul-wiring` OK、`test-agent-preset-patches` 全绿、`test-preset-local-tools` 8/8。
+人格已替换为候选版（sha256 `5ebd1774…`）。回滚点 `/root/backups/p1-20261030-151843`。
+
+**发布交接**：
+1. 同步 `dsh/agent-presets/soul-reflect/`、`plugins/surfcore/soul-reflect-guard.mjs`、
+   `plugins/surfcore/presets/soul-reflect.patch.yml`、`plugins/surfcore/package.json`、
+   `scripts/build-agent-preset-patches.mjs`、`src/soul.js`、`src/bridge.js`、`scripts/test-soul*.mjs`、
+   `scripts/test-preset-local-tools.mjs`、`scripts/test-agent-preset-patches.mjs`、`scripts/verify-agent-presets-017.mjs`、`docs/*`；
+2. 线上跑 `node scripts/setup-dsh.mjs` 重新生成并安装 patch；
+3. 在线上 `config.json` 的 `soul` 段加 `"reflectPreset": "soul-reflect"`（代码默认已是它）；
+4. 重启 DSH → `node scripts/verify-agent-presets-017.mjs <baseUrl>` 确认 `soul-reflect` 存在且 `broken` 为空；
+5. 重启桥接（单实例，先查 `state/bridge.lock` 与 `ps`）；**不要强制反思**，等下一次 03:40 自动跑；
+6. 观察 `characters/<id>/soul/state.json` 的 `concerns` 不再被一次反思清空、`narrative.md` 无 AI/号码；
+7. 回归：发布前跑 `npm run test:audit`；观察只有主人私聊注入【你此刻】，群聊不出现。
+
+---
+
+---
+
 > **2026-11-03 04:05：v0.8.7 已发布**，覆盖本表截至该时间的全部待发布批次（0.8.6 以来全部 dev，74 commits）。
 > 以下批次保留作追溯；后续新批次继续加在最上面。
 
