@@ -252,6 +252,37 @@ test('守卫仍放行 QQ MCP 命名空间与无害模型侧工具', async () => 
   }
 });
 
+test('灵魂反思 preset 不挂任何工具，守卫执行期全拒', async () => {
+  // 反思材料会读入群聊记忆与消息摘录，可能夹带注入文本；它既不能碰本地，
+  // 也不能借 QQ MCP 发消息。这里钉住「源里没有工具行」+「守卫拒绝一切」两道。
+  const { dir, yml } = readPreset('soul-reflect');
+  assert.doesNotMatch(yml, /mcp__snowluma__|mcp__web-search-safe__/, '反思 preset 不得挂 QQ/联网 MCP');
+  assert.doesNotMatch(yml, /id:\s*tool-web|id:\s*tool-ask-user|id:\s*tool-todo/, '反思 preset 不得挂模型侧工具行');
+  assert.match(yml, /soul-reflect-guard/, '反思 preset 必须挂全拒守卫');
+
+  const guardPath = path.join(dir, 'soul-reflect-guard.mjs');
+  assert.ok(fs.existsSync(guardPath), '反思守卫文件存在');
+  const restricted = new Set();
+  const fakeTools = {
+    restrict({ deny }) { for (const n of deny ?? []) restricted.add(n); },
+    guard(fn) { this._guard = fn; },
+  };
+  const mod = await import(pathToFileURL(guardPath).href);
+  mod.apply({ tools: fakeTools });
+
+  const missing = LOCAL_EXECUTION_TOOLS.filter((t) => !restricted.has(t));
+  assert.deepEqual(missing, [], `反思守卫的 restrict 名单缺少本地执行工具：${missing.join(', ')}`);
+  for (const name of [
+    ...LOCAL_EXECUTION_TOOLS.slice(0, 5),
+    'ask_user_question', 'todo_write',
+    'mcp__snowluma__qq_send_message', 'mcp__web-search-safe__web_search', '',
+  ]) {
+    const verdict = fakeTools._guard({ name });
+    assert.ok(typeof verdict === 'string' && verdict.length > 0,
+      `反思会话中的工具 "${name}" 必须被拒绝，实际 ${JSON.stringify(verdict)}`);
+  }
+});
+
 test('封闭 agent 的预设在创建后必须与仿真 preset 明确区分', () => {
   // qsh-closed 由 ADR 0003 定义为**故意**拥有完整本地工具面：它的守卫只负责
   // "哪些 QQ 动作可见"，不负责"本地工具权限边界"。

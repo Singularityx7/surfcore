@@ -45,10 +45,15 @@ import {
 } from './greeting-schedule.js';
 import {
   analyzePersona, applyPurposeOutcome, buildPurposePrompt, collectMaterials, deriveDrives,
-  ensurePurposeDay, ensurePurposeSchedule, evaluatePurposeTick, formGoalHypotheses,
-  markPurposeDelivered, markPurposeSkip, minePurposeSeeds, normalizePurposeConfig,
-  normalizePurposeState, parsePurposeMemo, planNextFire, selectPurpose, summarizePurposeState,
+  EMOTION_LABELS, ensurePurposeDay, ensurePurposeSchedule, evaluatePurposeTick, formGoalHypotheses,
+  markPurposeDelivered, markPurposeSkip, minePurposeSeeds, NEED_LABELS, normalizePurposeConfig,
+  normalizePurposeState, parsePurposeMemo, planNextFire, PURPOSE_NEEDS, selectPurpose, summarizePurposeState,
 } from './purpose-engine.js';
+import {
+  applySoulReflection, buildReflectionPrompt, createSoulState, deriveSoulState,
+  normalizeSoulConfig, normalizeSoulState, parseReflectionJson, planSoulReflection,
+  renderSoulBlock, summarizeSoulState,
+} from './soul.js';
 import { resolvePriceTable } from './model-prices.js';
 import { catalogChoices, findCatalogModel, pickCatalogFallback } from './model-options.js';
 import { createOutbox } from './outbox.js';
@@ -81,7 +86,7 @@ import {
   appendMemoryInboxEvent, looksNoteworthyMessage, resolveMemoryCardPaths,
 } from './memory-card.js';
 import {
-  activeMemoryPaths, activePersonaFile, activePlatformStateDir, characterPaths, readCurrentCharacter,
+  activeBiliDir, activeMemoryPaths, activePersonaFile, activePlatformStateDir, characterPaths, readCurrentCharacter,
   readPersonaLayerText,
 } from './character-persona.js';
 import { composePersonaLayers, personaSceneFromKey } from './persona-layers.js';
@@ -1324,6 +1329,9 @@ function loadConfig() {
   // 定期主动私聊主人，分享所想（🧀）或提出索取。默认开，但受安静时段/每日上限/token 额度约束。
   cfg.purpose = normalizePurposeConfig(file.purpose, { ownerQQ: cfg.ownerQQ });
 
+  // 角色灵魂：心情/精力/在意的事 + 每日自我叙事。默认开，可单独关。
+  cfg.soul = normalizeSoulConfig(file.soul);
+
   // B站记忆 / 动态同步 / 每日分享（config.json → biliBridge，全部可选，默认开启）。
   {
     const b = file.biliBridge && typeof file.biliBridge === 'object' && !Array.isArray(file.biliBridge) ? file.biliBridge : {};
@@ -1953,6 +1961,296 @@ async function main() {
   const learnerWaiters = new Map();     // sessionId -> [{resolve,reject,timer}]
   let slangLearnerSessionId = null;
   let slangTaskChain = Promise.resolve();
+
+  // ── 角色灵魂：心情 / 精力 / 在意的事 / 每日自我叙事 ─────────────────────
+  // 目的引擎管「想要什么」，这里管「现在是什么状态」。状态跟着当前角色走，
+  // 存在 characters/<id>/soul/；没有角色系统时回退 state/soul/。
+  const SOUL_PATHS = (() => {
+    const cur = readCurrentCharacter();
+    const paths = cur?.id ? characterPaths(cur.id) : null;
+    const dir = paths ? (paths.soulDir || path.join(paths.dir, 'soul')) : path.join(STATE_DIR, 'soul');
+    return {
+      dir,
+      state: path.join(dir, 'state.json'),
+      narrative: path.join(dir, 'narrative.md'),
+      previous: path.join(dir, 'narrative.prev.md'),
+      changelog: path.join(dir, 'changelog.jsonl'),
+      // 会话 id 跟着角色走：换角色后旧会话不能复用（它带着旧角色的人格与上下文）。
+      session: path.join(dir, 'session.json'),
+    };
+  })();
+  try { fs.mkdirSync(SOUL_PATHS.dir, { recursive: true, mode: 0o700 }); } catch {}
+  let soulState = normalizeSoulState(readJsonSafe(SOUL_PATHS.state, null));
+  let soulTimer = null;
+  let soulReflectRun = null;
+  let soulLastAttemptAt = 0;
+  let soulReflectSessionId = null;
+  let soulNarrativeCache = { key: '', text: '' };
+
+  function readSoulNarrative() {
+    try {
+      const stat = fs.statSync(SOUL_PATHS.narrative);
+      const key = `${stat.mtimeMs}:${stat.size}`;
+      if (soulNarrativeCache.key === key) return soulNarrativeCache.text;
+      const text = fs.readFileSync(SOUL_PATHS.narrative, 'utf8').trim();
+      soulNarrativeCache = { key, text };
+      return text;
+    } catch {
+      soulNarrativeCache = { key: '', text: '' };
+      return '';
+    }
+  }
+
+  function saveSoulState() {
+    try {
+      atomicWriteJson(SOUL_PATHS.state, soulState);
+    } catch (error) {
+      log(`[灵魂] 写状态失败：${error?.message ?? error}`);
+    }
+  }
+
+  function soulOwnerLastAt() {
+    try {
+      const owner = purposeOwnerId();
+      if (!owner) return 0;
+      const st = socialV2.conversations.get(`private:${owner}`);
+      return Number(st?.lastIncomingAt) || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  function soulDriveText() {
+    const drives = purposeState.drives || {};
+    const top = PURPOSE_NEEDS
+      .map((need) => ({ need, score: Number(drives[need]) || 0 }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 2)
+      .filter((item) => item.score >= 0.25)
+      .map((item) => NEED_LABELS[item.need] || item.need);
+    const emotion = EMOTION_LABELS[purposeState.lastEmotion] || purposeState.lastEmotionText || '';
+    return [top.length ? `最近比较想要：${top.join('、')}` : '', emotion ? `最近一次心里：${emotion}` : '']
+      .filter(Boolean)
+      .join('；');
+  }
+
+  function readSoulDiaryText() {
+    const parts = [];
+    try {
+      const file = path.join(activeMemoryPaths().dir, 'diary-inbox.jsonl');
+      if (fs.existsSync(file)) {
+        const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).slice(-6);
+        for (const line of lines) {
+          try {
+            const rec = JSON.parse(line);
+            const text = rec.text ?? rec.note ?? rec.content ?? rec.summary ?? '';
+            if (!text) continue;
+            const date = rec.date ?? rec.at ?? '';
+            parts.push(`- ${date ? `[${String(date).slice(0, 10)}] ` : ''}${String(text).slice(0, 300)}`);
+          } catch {}
+        }
+      }
+    } catch {}
+    try {
+      const biliDir = activeBiliDir();
+      for (const name of ['whale-diary.md', 'whale-diary-private.md']) {
+        const file = path.join(biliDir, name);
+        if (!fs.existsSync(file)) continue;
+        const text = fs.readFileSync(file, 'utf8').trim();
+        if (text) parts.push(`- ${name === 'whale-diary.md' ? '公开日记' : '私密日记'}：${text.slice(-900)}`);
+      }
+    } catch {}
+    return parts.join('\n').slice(0, 4000);
+  }
+
+  function invalidateSoulReflectSession() {
+    const oldId = soulReflectSessionId;
+    soulReflectSessionId = null;
+    if (oldId && !learnerWaiters.has(oldId) && !learnerCollectors.has(oldId)) {
+      learnerSessions.delete(oldId);
+      // 退役的反思会话也要退订：否则重连时它仍被 follow，事件流只增不减。
+      api.events.forget?.(oldId);
+    }
+    try { fs.unlinkSync(SOUL_PATHS.session); } catch {}
+  }
+
+  async function ensureSoulReflectSession() {
+    const preset = resolvePresetName(cfg.soul?.reflectPreset || 'soul-reflect', { strict: true });
+    if (!preset) throw new Error('灵魂反思缺少已验证的安全 preset，拒绝创建会话');
+    const saved = readJsonSafe(SOUL_PATHS.session, null);
+    const currentCharacterId = String(readCurrentCharacter()?.id || '');
+    const maxAge = Number(cfg.soul?.reflectSessionMaxAgeMs) || 7 * 24 * 60 * 60 * 1000;
+    const savedFresh = Number(saved?.createdAt) > 0 && Date.now() - Number(saved.createdAt) < maxAge;
+    if (saved?.preset !== preset || saved?.characterId !== currentCharacterId || !savedFresh) {
+      invalidateSoulReflectSession();
+    }
+    if (soulReflectSessionId) {
+      learnerSessions.add(soulReflectSessionId);
+      api.events.follow(soulReflectSessionId);
+      return soulReflectSessionId;
+    }
+    if (saved?.sessionId && saved.preset === preset && saved.characterId === currentCharacterId && savedFresh) {
+      const applied = await ensureChatModel(String(saved.sessionId));
+      if (applied === 'not-found') {
+        log(`[灵魂] 反思会话 ${saved.sessionId} 在 DSH 侧已不存在，重建`);
+        invalidateSoulReflectSession();
+      } else {
+        soulReflectSessionId = String(saved.sessionId);
+        learnerSessions.add(soulReflectSessionId);
+        api.events.follow(soulReflectSessionId);
+        return soulReflectSessionId;
+      }
+    }
+    const dir = path.join(STATE_DIR, 'soul-agent');
+    fs.mkdirSync(dir, { recursive: true });
+    const wsValue = unwrap(await api.workspace.create({ path: dir }), 'soul workspace.create');
+    if (wsValue.created) {
+      try { await api.workspace.rename({ workspaceId: wsValue.workspace.workspaceId, title: '灵魂反思' }); } catch {}
+    }
+    const value = unwrap(await api.sessions.create({
+      workspaceId: wsValue.workspace.workspaceId,
+      agentPreset: preset,
+    }), 'soul session.create');
+    soulReflectSessionId = value.sessionId;
+    learnerSessions.add(soulReflectSessionId);
+    api.events.follow(soulReflectSessionId);
+    await ensureChatModel(soulReflectSessionId);
+    fs.mkdirSync(SOUL_PATHS.dir, { recursive: true, mode: 0o700 });
+    atomicWriteJson(SOUL_PATHS.session, {
+      sessionId: soulReflectSessionId,
+      preset,
+      characterId: currentCharacterId,
+      createdAt: Date.now(),
+    });
+    log(`[灵魂] 反思会话已创建：${soulReflectSessionId}`);
+    return soulReflectSessionId;
+  }
+
+  async function runSoulReflection({ force = false } = {}) {
+    if (cfg.soul?.enabled === false || cfg.soul?.reflectEnabled === false) return { ok: false, reason: 'disabled' };
+    if (!dshReady) return { ok: false, reason: 'dsh' };
+    if (soulReflectRun) return { ok: false, reason: 'running' };
+    const now = Date.now();
+    const plan = planSoulReflection({ now, config: cfg.soul, state: soulState });
+    if (!plan.due && !force) return { ok: false, reason: plan.reason };
+    if (!force && now - soulLastAttemptAt < (Number(cfg.soul?.reflectRetryMs) || 3 * 60 * 60 * 1000)) {
+      return { ok: false, reason: 'retry-wait' };
+    }
+    const budget = learnerBudgetBlock();
+    if (budget) return { ok: false, reason: 'budget' };
+    soulReflectRun = { startedAt: now };
+    soulLastAttemptAt = now;
+    try {
+      const narrative = readSoulNarrative();
+      const prompt = buildReflectionPrompt({
+        now,
+        roleName: String(readRoleState().role || ''),
+        state: soulState,
+        narrative,
+        memoryText: memoryCardPromptBlock(),
+        diaryText: readSoulDiaryText(),
+        pendingText: (Array.isArray(purposeState.pending) ? purposeState.pending : []).slice(-5)
+          .map((p) => `- ${p.text}`).join('\n'),
+        driveText: soulDriveText(),
+        config: cfg.soul,
+      });
+      const sessionId = await ensureSoulReflectSession();
+      const accepted = await api.sessions.prompt({ sessionId, mode: 'queue', content: [{ type: 'text', text: prompt }] });
+      if (!accepted.result.ok) {
+        const code = String(accepted.result.error?.code ?? '');
+        const message = String(accepted.result.error?.message ?? '');
+        if (/not[- ]?found/i.test(`${code} ${message}`)) invalidateSoulReflectSession();
+        log(`[灵魂] 反思投递被拒：${code}: ${message}`);
+        return { ok: false, reason: 'rejected' };
+      }
+      const output = await waitLearnerTurn(sessionId, Number(cfg.soul?.reflectTimeoutMs) || 180000);
+      const parsed = parseReflectionJson(output, { now: Date.now(), config: cfg.soul });
+      if (!parsed.ok) {
+        log(`[灵魂] 反思结果没通过（${parsed.reason}），这次不改`);
+        return { ok: false, reason: parsed.reason };
+      }
+      if (narrative) {
+        try { fs.writeFileSync(SOUL_PATHS.previous, `${narrative}\n`, { encoding: 'utf8', mode: 0o600 }); } catch {}
+      }
+      fs.writeFileSync(SOUL_PATHS.narrative, `${parsed.reflection.narrative}\n`, { encoding: 'utf8', mode: 0o600 });
+      try {
+        fs.appendFileSync(SOUL_PATHS.changelog, `${JSON.stringify({
+          at: now,
+          day: localDateKey(now),
+          mood: parsed.reflection.mood,
+          valence: parsed.reflection.valence,
+          energy: parsed.reflection.energy,
+          concerns: parsed.reflection.concerns,
+          narrativeChars: parsed.reflection.narrative.length,
+          narrative: parsed.reflection.narrative,
+        })}\n`, { encoding: 'utf8', mode: 0o600 });
+      } catch {}
+      soulState = applySoulReflection(soulState, parsed.reflection, { now });
+      saveSoulState();
+      const summary = summarizeSoulState(soulState, { now });
+      log(`[灵魂] 今日反思已更新：${summary.mood}；${parsed.reflection.narrative.slice(0, 40)}…`);
+      return { ok: true, reflection: parsed.reflection };
+    } catch (error) {
+      log(`[灵魂] 反思失败：${error?.message ?? error}`);
+      return { ok: false, error: String(error?.message ?? error) };
+    } finally {
+      soulReflectRun = null;
+    }
+  }
+
+  function soulTick() {
+    try {
+      if (cfg.soul?.enabled === false) return;
+      const now = Date.now();
+      const lastOwnerAt = soulOwnerLastAt();
+      soulState = deriveSoulState({
+        state: soulState,
+        now,
+        drives: purposeState.drives,
+        lastOwnerAt,
+        lastSentAt: Number(purposeState.lastSentAt) || 0,
+        lastEmotion: purposeState.lastEmotion,
+        lastSocialAt: lastOwnerAt,
+      });
+      saveSoulState();
+      const plan = planSoulReflection({ now, config: cfg.soul, state: soulState });
+      if (!plan.due || soulReflectRun) return;
+      // 主人正在聊天 / 目的回合进行中时不插反思，等下一轮 tick。
+      let lastAiAt = 0;
+      try {
+        const owner = purposeOwnerId();
+        const st = owner ? socialV2.conversations.get(`private:${owner}`) : null;
+        lastAiAt = Number(st?.lastAiReplyAt) || 0;
+      } catch {}
+      if (purposeRun || now - Math.max(lastOwnerAt, lastAiAt) < 15 * 60 * 1000) return;
+      void runSoulReflection().catch((error) => log(`[灵魂] 反思任务异常：${error?.message ?? error}`));
+    } catch (error) {
+      log(`[灵魂] tick 异常：${error?.message ?? error}`);
+    }
+  }
+
+  function startSoulLoop() {
+    if (soulTimer || cfg.soul?.enabled === false) return;
+    soulTimer = setInterval(() => soulTick(), 10 * 60 * 1000);
+    soulTimer.unref?.();
+    setTimeout(() => soulTick(), 20 * 1000).unref?.();
+    log(`[灵魂] 已启动：状态每 10 分钟更新；每日反思 ${cfg.soul?.reflectHour || '03:40'}`);
+  }
+
+  function soulWakeBlock(key, st) {
+    if (cfg.soul?.enabled === false || cfg.soul?.stateInPrompt === false) return '';
+    const owner = purposeOwnerId();
+    // 状态里是她私下的心事（被主人嫌冷淡、欠一句话……），只在与主人的私聊里注入。
+    if (!owner || key !== `private:${owner}`) return '';
+    const lastOwnerAt = Number(st?.lastIncomingAt) || 0;
+    const text = renderSoulBlock(soulState, {
+      now: Date.now(),
+      drives: purposeState.drives,
+      lastOwnerAt,
+      maxChars: cfg.soul?.stateMaxChars || 120,
+    });
+    return text ? `${text}\n\n` : '';
+  }
 
   // ── 表情包体系（二代仿真）本地知识库 ────────────────────────────────────
   // 库文件损坏/读不动时**不能当成空库继续**：下面任何一次 saveStickerStoreSafe 都会把
@@ -2871,6 +3169,7 @@ async function main() {
     slangLearnerSessionId = null;
     if (oldId && !learnerWaiters.has(oldId) && !learnerCollectors.has(oldId)) {
       learnerSessions.delete(oldId);
+      api.events.forget?.(oldId);
     }
     try { fs.unlinkSync(SLANG_SESSION_FILE); } catch {}
   }
@@ -2895,7 +3194,7 @@ async function main() {
         if (settled) return;
         settled = true;
         removeWaiter();
-        const error = new Error(`等待学习会话 turn 超时(${timeoutMs}ms)`);
+        const error = new Error(`等待内部会话 turn 超时(${timeoutMs}ms)`);
         error.code = 'LEARNER_TURN_TIMEOUT';
         reject(error);
       }, timeoutMs);
@@ -3353,9 +3652,11 @@ async function main() {
     priceTable,
     // 会话 → QQ 会话归属：学习会话单独记账，其余未知会话归入「未归属」。
     resolveKey: (sessionId) => reverse.get(sessionId)
-      ?? (learnerSessions.has(sessionId) || (slangLearnerSessionId && sessionId === slangLearnerSessionId)
-        ? 'internal:黑话学习'
-        : undefined)
+      ?? (soulReflectSessionId && sessionId === soulReflectSessionId
+        ? 'internal:灵魂反思'
+        : learnerSessions.has(sessionId) || (slangLearnerSessionId && sessionId === slangLearnerSessionId)
+          ? 'internal:黑话学习'
+          : undefined)
   });
 
   // Phase 0A：只记录唤醒/prompt 字符数，不参与任何行为判断。
@@ -3846,6 +4147,10 @@ async function main() {
         // 目的机制：定期从近期记忆里提炼目的，主动私聊主人（默认开，可关）。
         if (cfg.purpose?.enabled !== false) {
           try { startPurposeLoop(); } catch (error) { log(`[目的] 启动失败：${error?.message ?? error}`); }
+        }
+        // 角色灵魂：状态随时间漂移；每天一次自我反思（独立于目的机制开关）。
+        if (cfg.soul?.enabled !== false) {
+          try { startSoulLoop(); } catch (error) { log(`[灵魂] 启动失败：${error?.message ?? error}`); }
         }
         if (currentMode === 'reserved2') {
           // 首次确定模式为 reserved2 后再恢复持久化的有限睡眠定时器，
@@ -4733,6 +5038,10 @@ async function main() {
             purpose: {
               enabled: cfg.purpose?.enabled !== false,
               ...summarizePurposeState(purposeState, { config: cfg.purpose }),
+            },
+            soul: {
+              enabled: cfg.soul?.enabled !== false,
+              ...summarizeSoulState(soulState),
             },
             // 对话收尾：给设置页卡片看「最近一次收在哪 / 下次怎么接 / 当前判断」。
             // 只放管理端状态（含会话 key），不进 agent 的受限视图。
@@ -5833,6 +6142,28 @@ async function main() {
             sendJson(result, result.ok ? 200 : 409);
           } catch (error) {
             sendJson({ ok: false, error: `试一次失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
+        // ── 角色灵魂：状态 / 手动反思（控制台专用，智能体不可见）─────────────
+        if (req.method === 'GET' && url.pathname === '/api/soul/status') {
+          sendJson({
+            ok: true,
+            enabled: cfg.soul?.enabled !== false,
+            config: cfg.soul,
+            state: summarizeSoulState(soulState),
+            narrative: readSoulNarrative(),
+            running: Boolean(soulReflectRun),
+          });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/soul/reflect') {
+          try {
+            const body = await readBody();
+            const result = await runSoulReflection({ force: body.force !== false });
+            sendJson(result, result.ok ? 200 : 409);
+          } catch (error) {
+            sendJson({ ok: false, error: `反思失败：${error?.message ?? error}` }, 500);
           }
           return;
         }
@@ -11572,7 +11903,7 @@ async function main() {
     if (!result.blocked) return null;
     if (Date.now() - lastLearnerBudgetLogAt > 10 * 60 * 1000) {
       lastLearnerBudgetLogAt = Date.now();
-      log(`[token-budget] 黑话学习暂停：${blockMessage(result.hits, 'Token 额度')}`);
+      log(`[token-budget] 内部任务（黑话学习 / 灵魂反思）暂停：${blockMessage(result.hits, 'Token 额度')}`);
     }
     return result;
   }
@@ -12317,6 +12648,9 @@ async function main() {
       ? biliMemory.briefBlock()
       : '';
     const memoryCardText = memoryCardPromptBlock(key);
+    const soulNarrative = cfg.soul?.enabled !== false && cfg.soul?.narrativeInPurpose !== false
+      ? readSoulNarrative()
+      : '';
     return [
       roleLine,
       // 人格卡是动机的先验：她是什么样的人，决定她更容易被什么打动。
@@ -12324,6 +12658,8 @@ async function main() {
       identityLine,
       adminText,
       memoryCardText ? `【记忆卡】\n${memoryCardText.slice(0, 2400)}` : '',
+      // 自我叙事是「她最近眼里的自己」，不是设定，也不每条唤醒都注入。
+      soulNarrative ? `【你最近的样子（自己写的，不是设定）】\n${soulNarrative.slice(0, cfg.soul.narrativeMaxChars || 600)}` : '',
       biliBrief ? `【B站记忆】\n${biliBrief.slice(0, 1800)}` : '',
     ].filter(Boolean);
   }
@@ -14620,7 +14956,9 @@ async function main() {
     const memoryCardLine = memoryCardText ? `${memoryCardText}\n\n` : '';
     const conversationLine = conversationIdentityLineV2(key);
     const voiceLine = voiceStatusLine();
-    const base = roleLine + identityLine + conversationLine + provenanceLine + adminLine + biliLine + memoryCardLine + voiceLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + closureLine + stickerLine + stickerMatchLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + fishGuardLine + tokenGuardLine + preSleepLine;
+    // 灵魂状态只在她确实有值得说的状态时才注入一行；没有就留空，省 token。
+    const soulLine = soulWakeBlock(key, st);
+    const base = roleLine + identityLine + conversationLine + provenanceLine + adminLine + biliLine + memoryCardLine + soulLine + voiceLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + closureLine + stickerLine + stickerMatchLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + fishGuardLine + tokenGuardLine + preSleepLine;
     lastWakePromptMeta = {
       role: roleLine.length,
       identity: identityLine.length,
@@ -16496,11 +16834,13 @@ async function main() {
                     if (learnerEnded.reason.kind === 'completed' && learnerEnded.text.trim()) {
                       waiter.resolve(learnerEnded.text);
                     } else {
-                      waiter.reject(new Error(`学习会话 turn 未正常完成：${learnerEnded.reason.kind}`));
+                      waiter.reject(new Error(`内部会话 turn 未正常完成：${learnerEnded.reason.kind}`));
                     }
                   }
-                  // 旧学习会话 turn 结束后从集合移除，避免残留
-                  if (frame.sessionId !== slangLearnerSessionId) learnerSessions.delete(frame.sessionId);
+                  // 旧内部会话 turn 结束后从集合移除，避免残留（黑话 / 灵魂反思的当前会话除外）
+                  if (frame.sessionId !== slangLearnerSessionId && frame.sessionId !== soulReflectSessionId) {
+                    learnerSessions.delete(frame.sessionId);
+                  }
                 }
               }
               continue;

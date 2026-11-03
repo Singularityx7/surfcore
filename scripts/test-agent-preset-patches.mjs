@@ -12,9 +12,11 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import yaml from 'js-yaml';
 import {
-  BUNDLE_DIR, GUARD_SPECIFIER, PRESETS, REPO_ROOT,
-  buildPatches, patchFileFor, presetRowId,
+  BUNDLE_DIR, GUARD_SPECIFIER, PRESETS, RELATIVE_ROW_REWRITES, REPO_ROOT,
+  SOUL_GUARD_SPECIFIER, buildPatches, patchFileFor, presetRowId,
 } from './build-agent-preset-patches.mjs';
+
+const QQ_PRESETS = PRESETS.filter((name) => name.startsWith('qq-'));
 
 let failures = 0;
 function ok(cond, label) {
@@ -51,7 +53,7 @@ for (const name of PRESETS) {
   // 与源行列表逐字对比：只允许守卫行的 name 被改写。
   const source = load(path.join(REPO_ROOT, 'dsh', 'agent-presets', name, 'agent.cordis.yml'));
   const expected = structuredClone(source);
-  for (const r of expected) if (r.name === './qq-tool-restrict.mjs') r.name = GUARD_SPECIFIER;
+  for (const r of expected) if (RELATIVE_ROW_REWRITES.has(r.name)) r.name = RELATIVE_ROW_REWRITES.get(r.name);
   assert.deepEqual(row.config.plugins, expected, `${name}: config.plugins 必须与 agent.cordis.yml 完全一致（守卫名除外）`);
   ok(true, `${name}: config.plugins 与 agent.cordis.yml 逐字一致（${expected.length} 行）`);
 
@@ -63,15 +65,28 @@ for (const name of PRESETS) {
 }
 
 console.log('## 3. 守卫行引用方式：只用「profile 目录可解析」的裸说明符');
-for (const name of PRESETS) {
+for (const name of QQ_PRESETS) {
   const row = load(patchFileFor(name))[0].insert[0];
   const guard = row.config.plugins.find((r) => r.id === 'qq-tool-restrict');
   ok(guard !== undefined, `${name}: 有 qq-tool-restrict 守卫行`);
   ok(guard?.name === GUARD_SPECIFIER, `${name}: 守卫行 name = ${GUARD_SPECIFIER}`);
-  const bad = row.config.plugins.filter((r) => typeof r.name === 'string' && (r.name.startsWith('.') || path.isAbsolute(r.name)));
-  ok(bad.length === 0, `${name}: 没有任何相对/绝对路径子行名（0.1.7 下会按 profile 目录解析而装不上）${bad.length ? `：${bad.map((r) => r.name).join(', ')}` : ''}`);
   const guardFile = path.join(BUNDLE_DIR, GUARD_SPECIFIER.slice('surfcore/'.length));
   ok(fs.existsSync(guardFile), `${name}: 守卫实现存在（${path.relative(REPO_ROOT, guardFile)}）`);
+}
+{
+  const row = load(patchFileFor('soul-reflect'))[0].insert[0];
+  const guard = row.config.plugins.find((r) => r.id === 'soul-reflect-guard');
+  ok(guard !== undefined, 'soul-reflect: 有 soul-reflect-guard 守卫行');
+  ok(guard?.name === SOUL_GUARD_SPECIFIER, `soul-reflect: 守卫行 name = ${SOUL_GUARD_SPECIFIER}`);
+  const toolRows = row.config.plugins.filter((r) => typeof r.id === 'string' && r.id !== 'persona' && r.id !== 'soul-reflect-guard');
+  ok(toolRows.length === 0, `soul-reflect: 除人格与守卫外不挂任何工具行（实际：${toolRows.map((r) => r.id).join(', ') || '无'}）`);
+  const guardFile = path.join(BUNDLE_DIR, SOUL_GUARD_SPECIFIER.slice('surfcore/'.length));
+  ok(fs.existsSync(guardFile), `soul-reflect: 守卫实现存在（${path.relative(REPO_ROOT, guardFile)}）`);
+}
+for (const name of PRESETS) {
+  const row = load(patchFileFor(name))[0].insert[0];
+  const bad = row.config.plugins.filter((r) => typeof r.name === 'string' && (r.name.startsWith('.') || path.isAbsolute(r.name)));
+  ok(bad.length === 0, `${name}: 没有任何相对/绝对路径子行名（0.1.7 下会按 profile 目录解析而装不上）${bad.length ? `：${bad.map((r) => r.name).join(', ')}` : ''}`);
 }
 
 console.log('## 4. bundle 声明与安全边界');
@@ -90,9 +105,9 @@ console.log('## 4. bundle 声明与安全边界');
   for (const needle of ["const SAFE_PREFIXES", "'mcp__snowluma__'", "'mcp__web-search-safe__'", 'SAFE_EXACT', 'return `工具 "']) {
     ok(canonicalText.includes(needle), `权威守卫包含 ${needle}`);
   }
-  // 一份实现：两个 preset 目录下的同名文件必须是 re-export 壳，且导出同名成员。
+  // 一份实现：QQ preset 目录下的同名文件必须是 re-export 壳，且导出同名成员。
   const canonicalMod = await import(pathToFileURL(canonical).href);
-  for (const name of PRESETS) {
+  for (const name of QQ_PRESETS) {
     const shim = path.join(REPO_ROOT, 'dsh', 'agent-presets', name, 'qq-tool-restrict.mjs');
     ok(/^export \* from '\.\.\/\.\.\/\.\.\/plugins\/surfcore\/qq-tool-restrict\.mjs'$/m.test(read(shim).trim()),
       `${name}/qq-tool-restrict.mjs 是指向唯一实现的 re-export 壳`);
@@ -102,6 +117,24 @@ console.log('## 4. bundle 声明与安全边界');
     assert.deepEqual(shimMod.inject, ['tools']);
   }
   ok(true, 're-export 壳与权威实现导出同一份 apply/inject');
+
+  // 灵魂反思守卫：复用危险名单做注册期隐藏，执行期拒绝所有工具（含 QQ MCP）。
+  const soulGuardPath = path.join(BUNDLE_DIR, SOUL_GUARD_SPECIFIER.slice('surfcore/'.length));
+  const soulShim = path.join(REPO_ROOT, 'dsh', 'agent-presets', 'soul-reflect', 'soul-reflect-guard.mjs');
+  ok(/^export \* from '\.\.\/\.\.\/\.\.\/plugins\/surfcore\/soul-reflect-guard\.mjs'$/m.test(read(soulShim).trim()),
+    'soul-reflect/soul-reflect-guard.mjs 是指向唯一实现的 re-export 壳');
+  const soulMod = await import(pathToFileURL(soulGuardPath).href);
+  const soulShimMod = await import(pathToFileURL(soulShim).href);
+  assert.equal(soulShimMod.apply, soulMod.apply, 'soul-reflect: 壳与实现在同一模块实例上');
+  let soulGuardFn;
+  const soulRestricted = [];
+  soulMod.apply({ tools: { restrict: ({ deny }) => soulRestricted.push(...deny), guard: (fn) => { soulGuardFn = fn; } } });
+  ok(soulRestricted.includes('pwsh') && soulRestricted.includes('read'), 'soul-reflect 守卫在注册期隐藏本地执行工具');
+  let soulDeniedAll = true;
+  for (const name of ['ask_user_question', 'todo_write', 'mcp__snowluma__qq_send_message', 'mcp__web-search-safe__web_search', 'pwsh', '', null, undefined]) {
+    if (typeof soulGuardFn({ name }) !== 'string') soulDeniedAll = false;
+  }
+  ok(soulDeniedAll, 'soul-reflect 守卫执行期拒绝所有工具（含 QQ MCP 与联网）');
 
   // fail-closed 复检（独立于 test-audit-setup-guards.mjs 的那份假 ctx 测试）。
   let guardFn;

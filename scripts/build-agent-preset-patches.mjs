@@ -23,8 +23,8 @@ import yaml from 'js-yaml';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(__dirname, '..');
 
-/** 由桥接托管的两个 preset（顺序即 patch 层顺序）。 */
-export const PRESETS = ['qq-chat', 'qq-chat-v2'];
+/** 由桥接托管的 preset（顺序即 patch 层顺序）。 */
+export const PRESETS = ['qq-chat', 'qq-chat-v2', 'soul-reflect'];
 
 /** preset 行 id：与 config.id（桥接解析的 preset 名）区分开，方便在 profile patch 里按行定位。 */
 export function presetRowId(name) {
@@ -42,9 +42,13 @@ export function presetRowId(name) {
  */
 export const GUARD_SPECIFIER = 'surfcore/qq-tool-restrict.mjs';
 
+/** 灵魂反思会话的守卫：执行期拒绝所有工具，不引用 QQ 白名单。 */
+export const SOUL_GUARD_SPECIFIER = 'surfcore/soul-reflect-guard.mjs';
+
 /** 源里允许出现的相对行名 → 新机制下的等价引用。其它相对名一律报错（避免静默装不上）。 */
-const RELATIVE_ROW_REWRITES = new Map([
+export const RELATIVE_ROW_REWRITES = new Map([
   ['./qq-tool-restrict.mjs', GUARD_SPECIFIER],
+  ['./soul-reflect-guard.mjs', SOUL_GUARD_SPECIFIER],
 ]);
 
 export const BUNDLE_DIR = path.join(REPO_ROOT, 'plugins', 'surfcore');
@@ -103,8 +107,11 @@ function normalizeRows(rows, preset) {
     return next;
   });
   const normalized = walk(rows, 'plugins');
-  for (const required of ['persona', 'qq-tool-restrict']) {
-    if (!seen.has(required)) throw new Error(`${preset}: 行列表缺少 ${required} 行（安全/人格边界不允许缺失）`);
+  const required = ['persona'];
+  if (preset.startsWith('qq-')) required.push('qq-tool-restrict');
+  if (preset === 'soul-reflect') required.push('soul-reflect-guard');
+  for (const id of required) {
+    if (!seen.has(id)) throw new Error(`${preset}: 行列表缺少 ${id} 行（安全/人格边界不允许缺失）`);
   }
   return normalized;
 }
@@ -129,11 +136,14 @@ export function renderPatch(name) {
       plugins,
     },
   };
+  const guardLine = name.startsWith('qq-')
+    ? `# 守卫行 qq-tool-restrict 用裸说明符 ${GUARD_SPECIFIER}：子行 name 按 profile 目录解析，`
+    : `# 守卫行 soul-reflect-guard 用裸说明符 ${SOUL_GUARD_SPECIFIER}：子行 name 按 profile 目录解析，`;
   const header = [
     `# 本文件由 scripts/build-agent-preset-patches.mjs 生成，请勿手工编辑。`,
     `# 源：dsh/agent-presets/${name}/preset.yml + agent.cordis.yml（人格正文与工具面都在那里改）。`,
     `# 作用：把 ${name} 作为一条 @deepseek-ai/dsh-agent-preset 行插入 profile（DSH 0.1.7+ 的 preset 机制）。`,
-    `# 守卫行 qq-tool-restrict 用裸说明符 ${GUARD_SPECIFIER}：子行 name 按 profile 目录解析，`,
+    guardLine,
     `# 该包以 link: 依赖注册在 profile package.json（node_modules junction 由 setup-dsh.mjs 维护）。`,
     '',
   ].join('\n');

@@ -405,6 +405,20 @@
     "maxCandidates": 6,
     "promptMaxChars": 16000
   },
+  "soul": {
+    "enabled": true,
+    "stateInPrompt": true,
+    "stateMaxChars": 120,
+    "narrativeInPurpose": true,
+    "narrativeMaxChars": 600,
+    "reflectEnabled": true,
+    "reflectPreset": "soul-reflect",
+    "reflectHour": "03:40",
+    "reflectMinChars": 80,
+    "reflectMaxChars": 420,
+    "reflectTimeoutMs": 180000,
+    "reflectRetryMs": 10800000
+  },
   "greetings": {
     "enabled": false,
     "morning": {

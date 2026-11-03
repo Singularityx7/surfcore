@@ -14,7 +14,7 @@
 import { discoverDshSessionCookie } from '../src/dsh-client.js';
 
 const BASE = process.argv[2] || process.env.DSH_BASE_URL || 'http://127.0.0.1:3080';
-const WANTED = ['qq-chat', 'qq-chat-v2'];
+const WANTED = ['qq-chat', 'qq-chat-v2', 'soul-reflect'];
 
 let failed = 0;
 function check(label, ok, detail = '') {
@@ -75,7 +75,12 @@ async function main() {
       const text = String(doc?.content ?? '');
       const rows = text.split('\n').filter((l) => /^- id:/.test(l)).map((l) => l.trim().slice(2));
       check(`${id} 可读回子行清单`, rows.length > 0, rows.join(' | '));
-      check(`${id} 含 qq-tool-restrict 守卫行`, text.includes('qq-tool-restrict'));
+      if (id === 'soul-reflect') {
+        check(`${id} 含 soul-reflect-guard 守卫行`, text.includes('soul-reflect-guard'));
+        check(`${id} 不挂 QQ MCP`, !text.includes('mcp__snowluma__'));
+      } else {
+        check(`${id} 含 qq-tool-restrict 守卫行`, text.includes('qq-tool-restrict'));
+      }
     } catch (error) {
       check(`${id} agentPresets/read`, false, error.message);
     }
